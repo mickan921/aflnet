@@ -1,8 +1,8 @@
-# Windows Port Status
+# WinAFLNet Windows Port Guide
 
-This repository is still primarily the original Unix AFLNet codebase. Native
-Windows support is being added incrementally so Windows protocol targets can be
-replayed first, then fuzzed through a Windows execution backend.
+WinAFLNet is a Windows-focused fork of the original Unix AFLNet codebase.
+Native Windows support is being added incrementally so Windows protocol targets
+can be replayed first, then fuzzed through a Windows execution backend.
 
 ## What Works Now
 

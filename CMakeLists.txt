@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(aflnet_windows_tools C)
+project(WinAFLNet C)
 
 if(MSVC)
-  message(FATAL_ERROR "The current AFLNet C sources use GNU C extensions. Use MinGW GCC or clang on Windows.")
+  message(FATAL_ERROR "The current WinAFLNet/AFLNet C sources use GNU C extensions. Use MinGW GCC or clang on Windows.")
 endif()
 
 set(CMAKE_C_STANDARD 99)

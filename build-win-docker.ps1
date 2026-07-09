@@ -1,6 +1,6 @@
 param(
   [string]$BuildDir = "build-win",
-  [string]$Image = "aflnet/windows-cross:latest",
+  [string]$Image = "winaflnet/windows-cross:latest",
   [switch]$Clean,
   [switch]$SkipImageBuild
 )

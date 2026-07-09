@@ -1,7 +1,7 @@
-# Windows Examples
+# WinAFLNet Windows Examples
 
 This directory contains tiny native Windows targets used to validate the
-incremental AFLNet Windows port.
+WinAFLNet Windows fuzzing path.
 
 ## SanitizerCoverage Runtime
 
