@@ -94,8 +94,8 @@ Windows smoke binaries.
 Example:
 
 ```powershell
-.\build-win\aflnet-replay.exe .\replayable-crashes\id_000000 RTSP 8554
-.\build-win\aflnet-replay.exe .\replayable-crashes\id_000000 RTSP tcp://localhost/8554
+.\build-win\aflnet-replay.exe .\replayable-crashes\id_000000 RTSP 8554 50 10000
+.\build-win\aflnet-replay.exe .\replayable-crashes\id_000000 RTSP tcp://localhost/8554 50 10000
 ```
 
 ## Smoke Test
@@ -126,11 +126,16 @@ packetized crash input.
 The nonzero-exit crash pass enables `--crash-on-exit` and checks for
 `crash_reason : nonzero_exit`.
 The TCP smoke pass also uses `-E` to prove that target-specific environment
-variables reach the launched Windows process.
+variables reach the launched Windows process. It also checks stale schema
+rotation for execution and queue-manifest logs, replay-helper timeout
+arguments, replay-helper argument and environment handling, and clean refusal
+for file paths.
 
 Manual state/coverage smoke command:
 
 ```powershell
+$envMarker = Join-Path (Resolve-Path .).Path "out-smoke\target-env-marker.txt"
+
 .\build-win\aflnet-win-fuzz.exe `
   -i .\tutorials\live555\in-rtsp `
   -o .\out-smoke `
@@ -138,10 +143,12 @@ Manual state/coverage smoke command:
   -P RTSP `
   -B .\out-smoke\coverage.bin `
   -C .\build-win `
-  -E AFLNET_SMOKE_ENV_MARKER=.\out-smoke\target-env-marker.txt `
+  -E "AFLNET_SMOKE_ENV_MARKER=$envMarker" `
   -X .\tutorials\live555\rtsp.dict `
-  -D 10000 `
-  -x 200 `
+  -D 100000 `
+  -W 50 `
+  -w 10000 `
+  -x 1 `
   -- aflnet-win-rtsp-smoke.exe 8554
 ```
 
@@ -160,8 +167,10 @@ Manual UDP state/coverage smoke command:
   -P RTSP `
   -B .\out-smoke-udp\coverage.bin `
   -C .\build-win `
-  -D 10000 `
-  -x 200 `
+  -D 100000 `
+  -W 50 `
+  -w 10000 `
+  -x 1 `
   -- aflnet-win-rtsp-smoke.exe 8555 udp
 ```
 
@@ -177,11 +186,22 @@ $server = Start-Process -FilePath .\build-win\aflnet-win-rtsp-smoke.exe `
   -PassThru `
   -WindowStyle Hidden
 
+$deadline = [DateTime]::UtcNow.AddSeconds(5)
+while ([DateTime]::UtcNow -lt $deadline) {
+  $ready = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 8554 `
+    -State Listen -ErrorAction SilentlyContinue
+  if ($ready) { break }
+  Start-Sleep -Milliseconds 50
+}
+if (-not $ready) { throw "Smoke server did not start listening on 127.0.0.1:8554" }
+
 .\build-win\aflnet-win-fuzz.exe `
   -i .\tutorials\live555\in-rtsp `
   -o .\out-smoke-no-launch `
   -N tcp://127.0.0.1/8554 `
   -P RTSP `
+  -W 50 `
+  -w 10000 `
   -x 1 `
   --no-launch
 
@@ -340,7 +360,7 @@ Crash or hang replay workflow:
 
 # Option B: replay manually.
 .\testOnDemandRTSPServer.exe 8554
-.\build-win\aflnet-replay.exe .\out-win\replayable-crashes\id_000000,exit_c0000005 RTSP tcp://127.0.0.1/8554
+.\build-win\aflnet-replay.exe .\out-win\replayable-crashes\id_000000,exit_c0000005 RTSP tcp://127.0.0.1/8554 50 10000
 ```
 
 If `--minidump` produced a sibling `.dmp`, open it directly in WinDbg or Visual

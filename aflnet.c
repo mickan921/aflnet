@@ -54,6 +54,76 @@ static int parse_status_code3(const char *line, unsigned int line_len,
   return *code_ref == 0;
 }
 
+int aflnet_region_span(const region_t *region, u32 buf_len,
+                       u32 *start_ref, u32 *len_ref) {
+  u32 start;
+  u32 end;
+
+  if (!region || !buf_len) return 1;
+  if (region->start_byte < 0 || region->end_byte < region->start_byte)
+    return 1;
+
+  start = (u32)region->start_byte;
+  end = (u32)region->end_byte;
+  if (start >= buf_len || end >= buf_len) return 1;
+
+  if (start_ref) *start_ref = start;
+  if (len_ref) *len_ref = end - start + 1;
+  return 0;
+}
+
+int aflnet_region_is_valid(const region_t *region, u32 buf_size) {
+  return aflnet_region_span(region, buf_size, NULL, NULL) == 0;
+}
+
+int aflnet_regions_are_valid(const region_t *regions, u32 region_count, u32 buf_size) {
+  u32 i;
+  int prev_end = -1;
+
+  if (!region_count) return 1;
+  if (!regions || !buf_size) return 0;
+
+  for (i = 0; i < region_count; i++) {
+    if (!aflnet_region_is_valid(&regions[i], buf_size)) return 0;
+    if (i && regions[i].start_byte <= prev_end) return 0;
+    prev_end = regions[i].end_byte;
+  }
+
+  return 1;
+}
+
+static int mqtt_read_remaining_length(const unsigned char *buf, u32 buf_size,
+                                      u32 offset, u32 *value_ref,
+                                      u32 *encoded_len_ref) {
+  u32 multiplier = 1;
+  u32 value = 0;
+  u32 i;
+
+  for (i = 0; i < 4; i++) {
+    unsigned char encoded;
+    u32 digit;
+
+    if (offset + i >= buf_size) return 1;
+
+    encoded = buf[offset + i];
+    digit = (u32)(encoded & 0x7f);
+    if (digit && multiplier > UINT_MAX / digit) return 1;
+    if (value > UINT_MAX - digit * multiplier) return 1;
+    value += digit * multiplier;
+
+    if ((encoded & 0x80) == 0) {
+      *value_ref = value;
+      *encoded_len_ref = i + 1;
+      return 0;
+    }
+
+    if (i == 3 || multiplier > UINT_MAX / 128) return 1;
+    multiplier *= 128;
+  }
+
+  return 1;
+}
+
 void init_message_code_map(){
   if (message_code_map) kh_destroy(32, message_code_map);
   message_code_map = kh_init(32);
@@ -658,15 +728,14 @@ region_t* extract_requests_ssh(unsigned char* buf, unsigned int buf_size, unsign
       } else {
         //It could be a normal message
         //Extract the message size stored in the first 4 bytes
-        unsigned int* size_buf = (unsigned int*)&mem[0];
-        unsigned int message_size = (unsigned int)ntohl(*size_buf);
+        unsigned int message_size = read_bytes_to_uint32((unsigned char *)mem, 0, 4);
         unsigned char message_code = (unsigned char)mem[5];
         //and skip the payload and the MAC
-        unsigned int bytes_to_skip = message_size - 2;
+        unsigned int bytes_to_skip = message_size > 2 ? message_size - 2 : 0;
         if ((message_code >= 20) && (message_code <= 49)) {
           //Do nothing
         } else {
-          bytes_to_skip += 8;
+          if (bytes_to_skip <= UINT_MAX - 8) bytes_to_skip += 8;
         }
 
         unsigned int temp_count = 0;
@@ -758,8 +827,7 @@ region_t* extract_requests_tls(unsigned char* buf, unsigned int buf_size, unsign
       //1st byte: content type
       //2nd and 3rd byte: TLS version
       //Extract the message size stored in the 4th and 5th bytes
-      u16* size_buf = (u16*)&mem[3];
-      u16 message_size = (u16)ntohs(*size_buf);
+      u16 message_size = (u16)read_bytes_to_uint32((unsigned char *)mem, 3, 2);
 
       //and skip the payload
       unsigned int bytes_to_skip = message_size;
@@ -906,8 +974,13 @@ region_t* extract_requests_dns(unsigned char* buf, unsigned int buf_size, unsign
     // A DNS header is 12 bytes long & the 1st null byte after that indicates the end of the query.
     if ((mem_count >= 12) && (*(mem+mem_count) == 0)) {
       // 4 bytes left of the tail.
-      cur_end += 4;
-      byte_count += 4;
+      if (byte_count + 4 >= buf_size) {
+        cur_end = buf_size - 1;
+        byte_count = buf_size - 1;
+      } else {
+        cur_end += 4;
+        byte_count += 4;
+      }
       region_count++;
       regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
       regions[region_count - 1].start_byte = cur_start;
@@ -1102,47 +1175,44 @@ region_t* extract_requests_ftp(unsigned char* buf, unsigned int buf_size, unsign
 
 region_t* extract_requests_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
 {
-  char *mem;
-  unsigned int mem_count = 0;
-  unsigned int mem_size = 1024;
   unsigned int region_count = 0;
   unsigned int cur_start = 0;
-  unsigned int cur_end = 0;
   region_t *regions = NULL;
-  mem=(char *)ck_alloc(mem_size);
+
   while(cur_start < buf_size)
   {
-		if ((buf_size - cur_start) == 1) {
-			region_count++;
-			regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
-			regions[region_count - 1].start_byte = cur_start;
-			regions[region_count - 1].end_byte = buf_size - 1;
-			regions[region_count - 1].state_sequence = NULL;
-			regions[region_count - 1].state_count = 0;	
-			break;	
-		}
-    // Read the packet header
-    memcpy(&mem[mem_count], buf + cur_start, 2);
-    cur_start = cur_start + 2;
-    // Check the packet length and update current_end
-    // mem[0] is Message Type. mem[1] is Msg Len.
-    if(mem[1] >= 0) 
-      cur_end = cur_start + mem[1] - 1;
-    else
-      cur_end = buf_size;
+    unsigned int packet_start = cur_start;
+    u32 remaining_len = 0;
+    u32 encoded_len = 0;
+    u32 header_len;
+    u32 payload_start;
+    u32 cur_end;
+
+    if (mqtt_read_remaining_length(buf, buf_size, cur_start + 1,
+                                   &remaining_len, &encoded_len)) {
+      cur_end = buf_size - 1;
+    } else {
+      header_len = 1 + encoded_len;
+      payload_start = cur_start + header_len;
+      if (remaining_len > buf_size - payload_start)
+        cur_end = buf_size - 1;
+      else if (remaining_len == 0)
+        cur_end = payload_start - 1;
+      else
+        cur_end = payload_start + remaining_len - 1;
+    }
+
     // Create a region for every request
 		region_count++;
 		regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
-		regions[region_count - 1].start_byte = cur_start - 2;
+		regions[region_count - 1].start_byte = packet_start;
 		regions[region_count - 1].end_byte = cur_end;
 		regions[region_count - 1].state_sequence = NULL;
 		regions[region_count - 1].state_count = 0;
     // Update the indices
-    mem_count = 0;
     cur_start = cur_end + 1;
-    cur_end = cur_start;
   }
-  if(mem) ck_free(mem);
+
   //in case region_count equals zero, it means that the structure of the buffer is broken
   //hence we create one region for the whole buffer
 	if ((region_count == 0) && (buf_size > 0)) {
@@ -1773,39 +1843,43 @@ unsigned int* extract_response_codes_ssh(unsigned char* buf, unsigned int buf_si
    if (state_sequence == NULL) PFATAL("Unable realloc a memory region to store state sequence");
    state_sequence[state_count - 1] = 0;
 
-   while (byte_count < buf_size) {
+   while (byte_count + 6 <= buf_size) {
       memcpy(mem, buf + byte_count, 6);
       byte_count += 6;
 
       /* If this is the identification message */
-      if (strstr(mem, "SSH")) {
+      if (!memcmp(mem, "SSH", 3)) {
         //Read until \x0D\x0A
         char tmp = 0x00;
-        while (tmp != 0x0A) {
+        while (byte_count < buf_size && tmp != 0x0A) {
           memcpy(&tmp, buf + byte_count, 1);
           byte_count += 1;
         }
+        if (tmp != 0x0A) break;
         state_count++;
         state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
         if (state_sequence == NULL) PFATAL("Unable realloc a memory region to store state sequence");
         state_sequence[state_count - 1] = 256; //Identification
       } else {
         //Extract the message type and skip the payload and the MAC
-        unsigned int* size_buf = (unsigned int*)&mem[0];
-        unsigned int message_size = (unsigned int)ntohl(*size_buf);
+        unsigned int message_size = read_bytes_to_uint32((unsigned char *)mem, 0, 4);
+        unsigned int bytes_to_skip;
 
         //Break if the response does not adhere to the known format(s)
         //Normally, it only happens in the last response
-        if (message_size - 2 > buf_size - byte_count) break;
+        if (message_size < 2) break;
 
         unsigned char message_code = (unsigned char)mem[5];
+        bytes_to_skip = message_size - 2;
         
         /* If this is a KEY exchange related message */
         if ((message_code >= 20) && (message_code <= 49)) {
           //Do nothing
         } else {
-          message_size += 8;
+          if (bytes_to_skip > UINT_MAX - 8) break;
+          bytes_to_skip += 8;
         }
+        if (bytes_to_skip > buf_size - byte_count) break;
 
         message_code = get_mapped_message_code(message_code);
 
@@ -1814,7 +1888,7 @@ unsigned int* extract_response_codes_ssh(unsigned char* buf, unsigned int buf_si
         if (state_sequence == NULL) PFATAL("Unable realloc a memory region to store state sequence");
         state_sequence[state_count - 1] = message_code;
 
-        byte_count += message_size - 2;
+        byte_count += bytes_to_skip;
       }
    }
    *state_count_ref = state_count;
@@ -1857,11 +1931,10 @@ unsigned int* extract_response_codes_tls(unsigned char* buf, unsigned int buf_si
         message_type = 0xFF;
       }
 
-      u16* size_buf = (u16*)&mem[3];
-      u16 message_size = (u16)ntohs(*size_buf);
+      u16 message_size = (u16)read_bytes_to_uint32((unsigned char *)mem, 3, 2);
 
       //and skip the payload
-      unsigned int bytes_to_skip = message_size - 1;
+      unsigned int bytes_to_skip = message_size ? message_size - 1 : 0;
       unsigned int temp_count = 0;
       while ((byte_count < buf_size) && (temp_count < bytes_to_skip)) {
         byte_count++;
@@ -2051,23 +2124,27 @@ unsigned int* extract_response_codes_dtls12(unsigned char* buf, unsigned int buf
 
   while (byte_count < buf_size) {
     // a DTLS 1.2 record has a 13 bytes header, followed by the contained message
-    if ( (buf_size - byte_count > 13) &&
+    if ( (buf_size - byte_count >= 13) &&
     (buf[byte_count] >= CCS_CONTENT_TYPE && buf[byte_count] <= HEARTBEAT_CONTENT_TYPE)  &&
     (memcmp(&buf[byte_count+1], dtls12_version, 2) == 0)) {
       unsigned char content_type = buf[byte_count];
       unsigned char message_type;
+      u32 available = buf_size - byte_count;
       u32 record_length = read_bytes_to_uint32(buf, byte_count+11, 2);
+      u32 record_total;
 
       // the record length exceeds buffer boundaries (not expected)
-      if (buf_size - byte_count - 13 - record_length < 0) {
+      if (record_length > available - 13) {
         message_type = MALFORMED_MESSAGE_TYPE;
+        record_total = available;
       }
       else {
+        record_total = 13 + record_length;
         switch(content_type) {
           case HS_CONTENT_TYPE: ;
-            unsigned char hs_msg_type = buf[byte_count+13];
             // the minimum size of a correct DTLS 1.2 handshake message is 12 bytes comprising fragment header fields
             if (record_length >= 12) {
+              unsigned char hs_msg_type = buf[byte_count+13];
               u32 frag_length = read_bytes_to_uint32(buf, byte_count+22, 3);
               // we can check if the handshake record is encrypted by subtracting fragment length from record length
               // which should yield 12 if the fragment is not encrypted
@@ -2147,7 +2224,7 @@ unsigned int* extract_response_codes_dtls12(unsigned char* buf, unsigned int buf
       state_count++;
       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
       state_sequence[state_count - 1] = status_code;
-      byte_count += record_length;
+      byte_count += record_total;
     } else {
       // we shouldn't really be reaching this code
       byte_count ++;
@@ -2274,65 +2351,47 @@ unsigned int* extract_response_codes_ftp(unsigned char* buf, unsigned int buf_si
 
 unsigned int* extract_response_codes_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
 {
-  unsigned char *mem;
 	unsigned int byte_count = 0;
-	unsigned int mem_count = 0;
-	unsigned int mem_size = 1024;
 	unsigned int *state_sequence = NULL;
 	unsigned int state_count = 0;
-  // Packet headers for MQTT broker responses
-	char start1[1]={0x20}; // Connect Ack
-	char start2[1]={0x40}; // Publish Ack
-  char start3[1]={0x50}; // Publish Receive
-  char start4[1]={0x62}; // Publish Release
-  char start5[1]={0x70}; // Publish complete
-	char start6[1]={0x90}; // Subscribe Ack
-  char start7[1]={0xB0}; // Unsubscribe Ack
-  char start8[1]={0xD0}; // Ping Response
-  char start9[1]={0xE0}; // Disconnect
-  char start10[1]={0xF0}; // Auth
-	mem=(unsigned char *)ck_alloc(mem_size);
 	// Initial state of the response state machine
 	state_count++;
 	state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
 	state_sequence[state_count - 1] = 0;
   while(byte_count < buf_size)
   {
-    // Copy the packet header to get the message type(mem[0])
-		memcpy(&mem[mem_count++], buf + byte_count++, 1);
-		memcpy(&mem[mem_count], buf + byte_count++, 1);
-    // printf("[fuzz]mem[0] is %02x\n",mem[0]);
-    // printf("[fuzz]mem[1] is %02x\n",mem[1]);
+    unsigned char message_code = buf[byte_count];
+    u32 remaining_len = 0;
+    u32 encoded_len = 0;
+    u32 header_len;
+    u32 payload_start;
+
+    if (mqtt_read_remaining_length(buf, buf_size, byte_count + 1,
+                                   &remaining_len, &encoded_len))
+      break;
+
+    header_len = 1 + encoded_len;
+    payload_start = byte_count + header_len;
+
     // Determine whether it's a response packet
-    if ((mem_count > 0) && ((memcmp(&mem[0], start1, 1) == 0) || (memcmp(&mem[0], start2, 1) == 0) || (memcmp(&mem[0], start3, 1) == 0) || (memcmp(&mem[0], start4, 1) == 0) || (memcmp(&mem[0], start5, 1) == 0) || (memcmp(&mem[0], start6, 1) == 0) || (memcmp(&mem[0], start7, 1) == 0) || (memcmp(&mem[0], start8, 1) == 0) || (memcmp(&mem[0], start9, 1) == 0) || (memcmp(&mem[0], start10, 1) == 0)))
+    if (message_code == 0x20 || message_code == 0x40 ||
+        message_code == 0x50 || message_code == 0x62 ||
+        message_code == 0x70 || message_code == 0x90 ||
+        message_code == 0xB0 || message_code == 0xD0 ||
+        message_code == 0xE0 || message_code == 0xF0)
     {
       // Get the response code(message type) from the packet
-      unsigned char message_code = (unsigned char)mem[0];
-      // printf("[fuzz]message_code is %02x\n",message_code);
-			if (message_code == 0) break;
-
       message_code = get_mapped_message_code(message_code);
 
       // Create a new state 
 			state_count++;
 			state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
 			state_sequence[state_count - 1] = message_code;
-			mem_count = 0;
-      // yk
-			byte_count = byte_count + mem[1];
     }
-    else
-    {
-      mem_count++;
-      if(mem_count == mem_size)
-      {
-        //enlarge the mem buffer
-        mem_size = mem_size * 2;
-        mem=(char *)ck_realloc(mem, mem_size); 
-      }
-    }
+
+    if (remaining_len > buf_size - payload_start) break;
+    byte_count = payload_start + remaining_len;
   }
-	if (mem) ck_free(mem);
 	*state_count_ref = state_count;
 	return state_sequence;
 }
@@ -2529,22 +2588,37 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
 klist_t(lms) *construct_kl_messages(u8* fname, region_t *regions, u32 region_count)
 {
   FILE *fseed = NULL;
+  long file_size;
   fseed = fopen(fname, "rb");
   if (fseed == NULL) PFATAL("Cannot open seed file %s", fname);
+
+  if (fseek(fseed, 0, SEEK_END)) PFATAL("Cannot seek seed file %s", fname);
+  file_size = ftell(fseed);
+  if (file_size < 0) PFATAL("Cannot get seed file size %s", fname);
+  if ((unsigned long)file_size > UINT_MAX)
+    FATAL("Seed file %s is too large", fname);
+  if (!aflnet_regions_are_valid(regions, region_count, (u32)file_size))
+    PFATAL("Invalid AFLNet request regions for %s", fname);
 
   klist_t(lms) *kl_messages = kl_init(lms);
   u32 i;
 
   for (i = 0; i < region_count; i++) {
-    //Identify region size
-    u32 len = regions[i].end_byte - regions[i].start_byte + 1;
+    u32 start;
+    u32 len;
+
+    if (aflnet_region_span(&regions[i], (u32)file_size, &start, &len))
+      PFATAL("Invalid AFLNet request region in %s", fname);
+    if (fseek(fseed, start, SEEK_SET))
+      PFATAL("Cannot seek seed file %s", fname);
 
     //Create a new message
     message_t *m = (message_t *) ck_alloc(sizeof(message_t));
     m->mdata = (char *) ck_alloc(len);
     m->msize = len;
     if (m->mdata == NULL) PFATAL("Unable to allocate memory region to store new message");
-    fread(m->mdata, 1, len, fseed);
+    if (fread(m->mdata, 1, len, fseed) != len)
+      PFATAL("Unable to read seed region from %s", fname);
 
     //Insert the message to the linked list
     *kl_pushp(lms, kl_messages) = m;

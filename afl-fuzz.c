@@ -1006,36 +1006,42 @@ int send_over_network()
     response_bytes = NULL;
   }
 
-  //Create a TCP/UDP socket
-  if (aflnet_init_sockets()) FATAL("Unable to initialize Windows sockets");
-
   aflnet_socket_t sockfd = AFLNET_INVALID_SOCKET;
-  if (net_protocol == PRO_TCP)
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  else if (net_protocol == PRO_UDP)
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-
-  if (sockfd == AFLNET_INVALID_SOCKET) {
-    PFATAL("Cannot create a socket");
-  }
+  struct timeval timeout;
 
   //Set timeout for socket data sending/receiving -- otherwise it causes a big delay
   //if the server is still alive after processing all the requests
-  struct timeval timeout;
   timeout.tv_sec = 0;
   timeout.tv_usec = socket_timeout_usecs;
-  aflnet_set_socket_timeout(sockfd, SO_SNDTIMEO, timeout);
 
-  memset(&serv_addr, '0', sizeof(serv_addr));
+  if (local_port == 0) {
+    if (aflnet_connect(&sockfd, net_protocol, (char *)net_ip, net_port, timeout))
+      return 1;
+  } else {
+    //Create a TCP/UDP socket
+    if (aflnet_init_sockets()) FATAL("Unable to initialize Windows sockets");
 
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_port = htons(net_port);
-  serv_addr.sin_addr.s_addr = inet_addr(net_ip);
+    if (net_protocol == PRO_TCP)
+      sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    else if (net_protocol == PRO_UDP)
+      sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
-  //This piece of code is only used for targets that send responses to a specific port number
-  //The Kamailio SIP server is an example. After running this code, the intialized sockfd 
-  //will be bound to the given local port
-  if(local_port > 0) {
+    if (sockfd == AFLNET_INVALID_SOCKET) {
+      PFATAL("Cannot create a socket");
+    }
+
+    aflnet_set_socket_timeout(sockfd, SO_SNDTIMEO, timeout);
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    memset(&local_serv_addr, 0, sizeof(local_serv_addr));
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(net_port);
+    serv_addr.sin_addr.s_addr = inet_addr((char *)net_ip);
+
+    //This piece of code is only used for targets that send responses to a specific port number
+    //The Kamailio SIP server is an example. After running this code, the intialized sockfd
+    //will be bound to the given local port
     local_serv_addr.sin_family = AF_INET;
     local_serv_addr.sin_addr.s_addr = INADDR_ANY;
     local_serv_addr.sin_port = htons(local_port);
@@ -1044,18 +1050,18 @@ int send_over_network()
     if (bind(sockfd, (struct sockaddr*) &local_serv_addr, sizeof(struct sockaddr_in)))  {
       FATAL("Unable to bind socket on local source port");
     }
-  }
 
-  if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == AFLNET_SOCKET_ERROR) {
-    //If it cannot connect to the server under test
-    //try it again as the server initial startup time is varied
-    for (n=0; n < 1000; n++) {
-      if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) break;
-      aflnet_sleep_us(1000);
-    }
-    if (n== 1000) {
-      aflnet_close_socket(sockfd);
-      return 1;
+    if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == AFLNET_SOCKET_ERROR) {
+      //If it cannot connect to the server under test
+      //try it again as the server initial startup time is varied
+      for (n=0; n < 1000; n++) {
+        if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) break;
+        aflnet_sleep_us(1000);
+      }
+      if (n== 1000) {
+        aflnet_close_socket(sockfd);
+        return 1;
+      }
     }
   }
 
@@ -1623,6 +1629,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
     if (byte_count != len) PFATAL("AFLNet - Inconsistent file length '%s'", fname);
     q->regions = (*extract_requests)(buf, len, &q->region_count);
+    if (!aflnet_regions_are_valid(q->regions, q->region_count, len))
+      PFATAL("AFLNet - Invalid request regions extracted from '%s'", fname);
     ck_free(buf);
 
     //Keep track the maximal number of seed regions
@@ -1632,6 +1640,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   } else {
     //Convert the linked list kl_messages to regions
     q->regions = convert_kl_messages_to_regions(kl_messages, &q->region_count, messages_sent);
+    if (!aflnet_regions_are_valid(q->regions, q->region_count, len))
+      PFATAL("AFLNet - Invalid request regions converted for '%s'", fname);
   }
 
   /* save the regions' information to file for debugging purpose */
@@ -5416,6 +5426,10 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   u32 region_count = 0;
   region_t *regions = (*extract_requests)(out_buf, len, &region_count);
   if (!region_count) PFATAL("AFLNet Region count cannot be Zero");
+  if (!aflnet_regions_are_valid(regions, region_count, len)) {
+    ck_free(regions);
+    return 0;
+  }
 
   // update kl_messages linked list
   u32 i;
@@ -5424,20 +5438,27 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   // limit the #messages based on max_seed_region_count to reduce overhead
   for (i = 0; i < region_count; i++) {
-    u32 len;
-    //Identify region size
+    region_t merged_region;
+    u32 start, msg_len;
+
     if (i == max_seed_region_count) {
-      len = regions[region_count - 1].end_byte - regions[i].start_byte + 1;
+      merged_region = regions[i];
+      merged_region.end_byte = regions[region_count - 1].end_byte;
     } else {
-      len = regions[i].end_byte - regions[i].start_byte + 1;
+      merged_region = regions[i];
+    }
+
+    if (aflnet_region_span(&merged_region, len, &start, &msg_len)) {
+      if (i == max_seed_region_count) break;
+      continue;
     }
 
     //Create a new message
     message_t *m = (message_t *) ck_alloc(sizeof(message_t));
-    m->mdata = (char *) ck_alloc(len);
-    m->msize = len;
+    m->mdata = (char *) ck_alloc(msg_len);
+    m->msize = msg_len;
     if (m->mdata == NULL) PFATAL("Unable to allocate memory region to store new message");
-    memcpy(m->mdata, &out_buf[regions[i].start_byte], len);
+    memcpy(m->mdata, &out_buf[start], msg_len);
 
     //Insert the message to the linked list
     *kl_pushp(lms, kl_messages) = m;
@@ -5956,6 +5977,8 @@ AFLNET_REGIONS_SELECTION:;
   }
 
   /* Construct the kl_messages linked list and identify boundary pointers (M2_prev and M2_next) */
+  if (!aflnet_regions_are_valid(queue_cur->regions, queue_cur->region_count, queue_cur->len))
+    return 1;
   kl_messages = construct_kl_messages(queue_cur->fname, queue_cur->regions, queue_cur->region_count);
 
   kliter_t(lms) *it;
@@ -7750,6 +7773,13 @@ static void sync_fuzzers(char** argv) {
         region_t *regions;
         u32 region_count;
         regions = (*extract_requests)(mem, st.st_size, &region_count);
+        if (!aflnet_regions_are_valid(regions, region_count, (u32)st.st_size)) {
+          ck_free(regions);
+          munmap(mem, st.st_size);
+          ck_free(path);
+          close(fd);
+          continue;
+        }
         kl_messages = construct_kl_messages(path, regions, region_count);
 
         fault = run_target(argv, exec_tmout);

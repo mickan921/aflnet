@@ -154,6 +154,15 @@ if ([System.IO.Path]::IsPathRooted($BuildDir)) {
 $resolvedBuildDir = [System.IO.Path]::GetFullPath($resolvedBuildDir)
 
 if ($Clean -and (Test-Path -LiteralPath $resolvedBuildDir)) {
+  if (-not (Test-Path -LiteralPath $resolvedBuildDir -PathType Container)) {
+    throw "Refusing to clean non-directory build path: $resolvedBuildDir"
+  }
+
+  $buildItem = Get-Item -LiteralPath $resolvedBuildDir -Force
+  if (($buildItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Refusing to clean reparse-point build directory: $resolvedBuildDir"
+  }
+
   $repoRoot = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\', '/')
   $buildRoot = [System.IO.Path]::GetPathRoot($resolvedBuildDir).TrimEnd('\', '/')
   $safeBuildDir = $resolvedBuildDir.TrimEnd('\', '/')

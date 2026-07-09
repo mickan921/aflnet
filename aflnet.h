@@ -130,6 +130,10 @@ int net_recv(aflnet_socket_t sockfd, struct timeval timeout, int poll_w, char **
 /* Construct a new linked list to store all messages from a list of regions */
 klist_t(lms) *construct_kl_messages(u8* fname, region_t *regions, u32 region_count);
 
+/* Validate request regions before they are used to read, copy, or send data. */
+int aflnet_region_is_valid(const region_t *region, u32 buf_size);
+int aflnet_regions_are_valid(const region_t *regions, u32 region_count, u32 buf_size);
+
 /* Free all items and delete kl_messages */
 void delete_kl_messages(klist_t(lms) *kl_messages);
 
@@ -170,6 +174,10 @@ int aflnet_parse_replay_target(const char *target_arg, const char *protocol,
 
 /* Convert state sequence to string */
 u8* state_sequence_to_string(unsigned int *stateSequence, unsigned int stateCount);
+
+/* Return a safe byte span for a parser-produced request region. */
+int aflnet_region_span(const region_t *region, u32 buf_len,
+                       u32 *start_ref, u32 *len_ref);
 
 /* Print the hexdump of a segment of a buffer preceded by a messsage */
 void hexdump(unsigned char *msg, unsigned char * buf, int start, int end);

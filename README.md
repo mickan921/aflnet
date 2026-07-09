@@ -125,7 +125,8 @@ powershell -ExecutionPolicy Bypass -File .\examples\windows\run_smoke.ps1 -Clean
 The smoke suite verifies TCP, UDP, no-launch mode, dry-run mode, state
 discovery, optional bitmap coverage, corpus growth, crash artifacts, minidumps,
 nonzero-exit crash handling, hang artifacts, replay helper generation,
-environment-variable propagation, log schema rotation, and resume counters.
+environment-variable propagation, log schema rotation, queue-manifest schema
+rotation, file-path clean refusal, and resume counters.
 
 ## Walkthrough: Fuzz The Included Smoke Target
 
@@ -276,8 +277,8 @@ Start the target yourself, then run:
   -N tcp://127.0.0.1/9000 `
   -P RTSP `
   -D 0 `
-  -W 100 `
-  -w 50000 `
+  -W 50 `
+  -w 10000 `
   --no-launch
 ```
 
@@ -373,7 +374,9 @@ Manual replay:
 .\build-win\aflnet-replay.exe `
   .\out-my-target\replayable-crashes\id_000000,exit_c0000005,hash_12345678 `
   RTSP `
-  tcp://127.0.0.1/9000
+  tcp://127.0.0.1/9000 `
+  50 `
+  10000
 ```
 
 For raw non-packetized request streams, use `afl-replay.exe` instead.

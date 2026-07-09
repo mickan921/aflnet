@@ -36,6 +36,34 @@ function Assert-TextContains($Path, $Pattern, $Description) {
   }
 }
 
+function Assert-Throws($ScriptBlock, $Pattern, $Description) {
+  try {
+    & $ScriptBlock
+  } catch {
+    if ($_.Exception.Message -match $Pattern) {
+      return
+    }
+
+    throw "$Description failed with unexpected error: $($_.Exception.Message)"
+  }
+
+  throw "$Description did not fail"
+}
+
+function Assert-ReplayHelperCommon($Path, [switch]$ExpectTargetEnv) {
+  $null = [scriptblock]::Create((Get-Content -Raw -LiteralPath $Path))
+  Assert-TextContains $Path "Start-Sleep -Milliseconds 100" "replay helper"
+  Assert-TextContains $Path '\[System\.Diagnostics\.ProcessStartInfo\]::new\(\)' "replay helper"
+  Assert-TextContains $Path 'ArgumentList\.Add\(\$arg\)' "replay helper argument preservation"
+  Assert-TextContains $Path "'50', '10000'\)" "replay helper timeout preservation"
+  Assert-TextContains $Path '\$replayStartInfo\.FileName\s*=\s*\$AFLNetReplay' "replay helper replay path"
+
+  if ($ExpectTargetEnv) {
+    Assert-TextContains $Path '\$targetStartInfo\.UseShellExecute\s*=\s*\$false' "replay helper target environment"
+    Assert-TextContains $Path '\$targetStartInfo\.EnvironmentVariables\[\$name\]\s*=\s*\$targetEnv\[\$name\]' "replay helper target environment"
+  }
+}
+
 function Assert-CrashArtifactSet($Path, [switch]$ExpectMinidump, [string]$ExpectedEnv = "", [string]$ExpectedReason = "") {
   Assert-Path $Path "crash smoke replayable-crashes"
 
@@ -63,6 +91,8 @@ function Assert-CrashArtifactSet($Path, [switch]$ExpectMinidump, [string]$Expect
   Assert-TextContains $metadata "^exit_code\s*:" "crash metadata"
   Assert-TextContains $metadata "^exit_name\s*:" "crash metadata"
   Assert-TextContains $metadata "^crash_hash\s*:" "crash metadata"
+  Assert-TextContains $metadata "^poll_wait_msecs\s*:\s*50\s*$" "crash metadata"
+  Assert-TextContains $metadata "^socket_timeout_us\s*:\s*10000\s*$" "crash metadata"
   if ($ExpectedReason) {
     Assert-TextContains $metadata "^crash_reason\s*:\s*$([regex]::Escape($ExpectedReason))\s*$" "crash metadata"
   }
@@ -73,9 +103,9 @@ function Assert-CrashArtifactSet($Path, [switch]$ExpectMinidump, [string]$Expect
     Assert-TextContains $metadata "^target_env_vars\s*:\s*1\s*$" "crash metadata"
     Assert-TextContains $metadata "^target_env_000\s*:\s*$([regex]::Escape($ExpectedEnv))\s*$" "crash metadata"
   }
-  Assert-TextContains $metadata "^manual_replay_cmd\s*:" "crash metadata"
+  Assert-TextContains $metadata "^manual_replay_cmd\s*:.*\s50\s+10000\s*$" "crash metadata"
 
-  $null = [scriptblock]::Create((Get-Content -Raw -LiteralPath $replayScript))
+  Assert-ReplayHelperCommon $replayScript -ExpectTargetEnv:([bool]$ExpectedEnv)
 }
 
 function Assert-HangArtifactSet($Path) {
@@ -96,9 +126,11 @@ function Assert-HangArtifactSet($Path) {
   Assert-Path $replayScript "hang replay helper"
   Assert-TextContains $metadata "^hang_hash\s*:" "hang metadata"
   Assert-TextContains $metadata "^timeout_ms\s*:" "hang metadata"
-  Assert-TextContains $metadata "^manual_replay_cmd\s*:" "hang metadata"
+  Assert-TextContains $metadata "^poll_wait_msecs\s*:\s*50\s*$" "hang metadata"
+  Assert-TextContains $metadata "^socket_timeout_us\s*:\s*10000\s*$" "hang metadata"
+  Assert-TextContains $metadata "^manual_replay_cmd\s*:.*\s50\s+10000\s*$" "hang metadata"
 
-  $null = [scriptblock]::Create((Get-Content -Raw -LiteralPath $replayScript))
+  Assert-ReplayHelperCommon $replayScript
 }
 
 function Assert-DiscoveryMetadata($Path, $Kind) {
@@ -144,6 +176,15 @@ function Write-StaleExecLog($Path) {
   Write-AsciiFile $Path "$staleHeader`r`n0`tstale.raw`told`t0`t0`t0`t0`t0x00000000`t0`t0`t0`t0`t0`t0`t0`r`n"
 }
 
+function Write-StaleQueueManifest($Path) {
+  $staleHeader = "kind`tqueue_path`tsource_seed`tsignal_hash`tdetail"
+  Write-AsciiFile $Path "$staleHeader`r`nstate`tqueue\stale.raw`tstale.raw`t00000000`told`r`n"
+}
+
+function Assert-RotatedOldSchema($Path, $Description) {
+  Assert-Path "$Path.old-schema" "$Description old-schema rotation"
+}
+
 function Get-StatsValue($Path, $Name) {
   $pattern = "^\s*" + [regex]::Escape($Name) + "\s*:\s*(.+?)\s*$"
 
@@ -175,6 +216,15 @@ function Assert-StatsEquals($Path, $Name, $Expected) {
 function Remove-SafeDirectory($Path) {
   if (-not (Test-Path -LiteralPath $Path)) { return }
 
+  if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+    throw "Refusing to remove non-directory smoke output path: $Path"
+  }
+
+  $pathItem = Get-Item -LiteralPath $Path -Force
+  if (($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Refusing to remove reparse-point smoke output directory: $Path"
+  }
+
   $repoRootClean = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
   $pathRootClean = [System.IO.Path]::GetPathRoot($Path).TrimEnd('\', '/')
   $pathClean = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
@@ -196,6 +246,13 @@ function Write-AsciiFile($Path, $Text) {
   [System.IO.File]::WriteAllText($Path, $Text, $encoding)
 }
 
+function Assert-CleanRejectsFilePath($Path) {
+  Write-AsciiFile $Path "not a directory`r`n"
+  Assert-Throws { Remove-SafeDirectory $Path } "non-directory" "file-path clean refusal"
+  Assert-Path $Path "file left untouched by clean refusal"
+  Remove-Item -LiteralPath $Path -Force
+}
+
 function Invoke-Fuzzer([string[]]$Arguments, [string]$Label) {
   & $Fuzzer @Arguments
 
@@ -204,14 +261,55 @@ function Invoke-Fuzzer([string[]]$Arguments, [string]$Label) {
   }
 }
 
+function Test-TcpListenerReady([string]$Address, [int]$Port) {
+  $targetAddress = [System.Net.IPAddress]::Parse($Address)
+  $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+
+  foreach ($listener in $listeners) {
+    if ($listener.Port -ne $Port) {
+      continue
+    }
+
+    if ($listener.Address.Equals($targetAddress) -or
+        $listener.Address.Equals([System.Net.IPAddress]::Any) -or
+        $listener.Address.Equals([System.Net.IPAddress]::IPv6Any)) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Wait-TcpListenerReady([string]$Address, [int]$Port, $Process, [int]$TimeoutMs) {
+  $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+
+  while ([DateTime]::UtcNow -lt $deadline) {
+    if ($Process -and $Process.HasExited) {
+      throw "external smoke server exited before listening on $Address`:$Port with code $($Process.ExitCode)"
+    }
+
+    if (Test-TcpListenerReady -Address $Address -Port $Port) {
+      return
+    }
+
+    Start-Sleep -Milliseconds 25
+  }
+
+  throw "Timed out waiting for external smoke server to listen on $Address`:$Port"
+}
+
 function Invoke-NoLaunchFuzzer([string[]]$Arguments, [string]$Label) {
+  if (Test-TcpListenerReady -Address "127.0.0.1" -Port $Port) {
+    throw "Port $Port is already listening before $Label starts its external smoke server"
+  }
+
   $serverProcess = Start-Process -FilePath $Server `
     -ArgumentList "$Port" `
     -WorkingDirectory $BuildDir `
     -PassThru `
     -WindowStyle Hidden
 
-  Start-Sleep -Milliseconds 200
+  Wait-TcpListenerReady -Address "127.0.0.1" -Port $Port -Process $serverProcess -TimeoutMs 5000
 
   try {
     Invoke-Fuzzer -Arguments $Arguments -Label $Label
@@ -253,6 +351,7 @@ if ($Clean) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+Assert-CleanRejectsFilePath (Join-Path $OutDir "clean-refuses-file.tmp")
 
 $SeedDir = Join-Path $OutDir "seeds"
 $CrashSeedDir = Join-Path $OutDir "crash-seeds"
@@ -318,6 +417,7 @@ Write-AsciiFile (Join-Path $ExitSeedDir "rtsp-exit.raw") $ExitSeed
 Write-AsciiFile (Join-Path $HangSeedDir "rtsp-hang.raw") $HangSeed
 New-Item -ItemType Directory -Force -Path $BasicOut | Out-Null
 Write-StaleExecLog (Join-Path $BasicOut "exec_log.tsv")
+Write-StaleQueueManifest (Join-Path $BasicOut "queue_manifest.tsv")
 
 Invoke-Fuzzer -Arguments @(
   "-i", $SeedDir,
@@ -353,7 +453,8 @@ Assert-TextContains $BasicStats "^exec_log\s*:" "state smoke fuzzer_stats"
 Assert-Path $EnvMarkerPath "target environment marker"
 Assert-Path (Join-Path $BasicOut "coverage_bits.bin") "persisted coverage bitmap discovery state"
 Assert-Path (Join-Path $BasicOut "coverage_hashes.txt") "coverage hash index"
-Assert-Path (Join-Path $BasicOut "exec_log.tsv.old-schema") "rotated stale execution log"
+Assert-RotatedOldSchema (Join-Path $BasicOut "exec_log.tsv") "stale execution log"
+Assert-RotatedOldSchema (Join-Path $BasicOut "queue_manifest.tsv") "stale queue manifest"
 Assert-DiscoveryMetadata (Join-Path $BasicOut "states") "state"
 Assert-DiscoveryMetadata (Join-Path $BasicOut "coverage") "coverage"
 Assert-QueueManifest (Join-Path $BasicOut "queue_manifest.tsv")

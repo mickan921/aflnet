@@ -8,6 +8,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Resolve-RepoRelativeBuildDir($Path) {
+  if ([string]::IsNullOrWhiteSpace($Path)) {
+    throw "BuildDir cannot be empty"
+  }
+
   if ([System.IO.Path]::IsPathRooted($Path)) {
     throw "BuildDir must be relative to the repository when using Docker: $Path"
   }
@@ -18,6 +22,10 @@ function Resolve-RepoRelativeBuildDir($Path) {
   foreach ($part in $parts) {
     if ($part -eq "..") {
       throw "BuildDir must stay inside the repository: $Path"
+    }
+
+    if ($part -notmatch '^[A-Za-z0-9._-]+$') {
+      throw "BuildDir may only contain letters, numbers, dots, underscores, hyphens, and directory separators when using Docker: $Path"
     }
   }
 
@@ -30,6 +38,15 @@ function Resolve-RepoRelativeBuildDir($Path) {
 
 function Remove-SafeBuildDir($Path) {
   if (-not (Test-Path -LiteralPath $Path)) { return }
+
+  if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+    throw "Refusing to clean non-directory build path: $Path"
+  }
+
+  $buildItem = Get-Item -LiteralPath $Path -Force
+  if (($buildItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Refusing to clean reparse-point build directory: $Path"
+  }
 
   $repoRootClean = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
   $pathRootClean = [System.IO.Path]::GetPathRoot($Path).TrimEnd('\', '/')

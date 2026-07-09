@@ -40,11 +40,15 @@ queue manifest, active corpus growth, no-launch mode, dry-run mode, crash hash
 indexing, crash minidumps, nonzero-exit crash handling, target environment
 propagation, replay-helper, discovery metadata, crash metadata, hang metadata,
 dictionary loading, `exec_log.tsv` target PID/crash-reason fields, and
-`fuzzer_stats` target command/environment fields.
+`fuzzer_stats` target command/environment fields. It also checks stale
+execution-log and queue-manifest rotation, replay-helper timeout arguments,
+replay-helper environment restoration, and file-path clean refusal.
 
 Manual equivalent:
 
 ```powershell
+$envMarker = Join-Path (Resolve-Path .).Path "out-smoke\target-env-marker.txt"
+
 .\build-win\aflnet-win-fuzz.exe `
   -i .\tutorials\live555\in-rtsp `
   -o .\out-smoke `
@@ -52,8 +56,12 @@ Manual equivalent:
   -P RTSP `
   -B .\out-smoke\coverage.bin `
   -C .\build-win `
+  -E "AFLNET_SMOKE_ENV_MARKER=$envMarker" `
   -X .\tutorials\live555\rtsp.dict `
-  -x 200 `
+  -D 100000 `
+  -W 50 `
+  -w 10000 `
+  -x 1 `
   -- aflnet-win-rtsp-smoke.exe 8554
 ```
 
@@ -67,6 +75,9 @@ UDP equivalent:
   -P RTSP `
   -B .\out-smoke-udp\coverage.bin `
   -C .\build-win `
-  -x 200 `
+  -D 100000 `
+  -W 50 `
+  -w 10000 `
+  -x 1 `
   -- aflnet-win-rtsp-smoke.exe 8555 udp
 ```

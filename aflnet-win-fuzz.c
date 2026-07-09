@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 #include <time.h>
 
 #include "alloc-inl.h"
@@ -170,8 +171,9 @@ static u32 parse_u32_option(const char *value, const char *option_name) {
 
   if (!value || !*value || value[0] == '-') FATAL("Bad value for %s: %s", option_name, value ? value : "(null)");
 
+  errno = 0;
   parsed = strtoul(value, &end, 10);
-  if (!end || *end || parsed > UINT_MAX)
+  if (errno == ERANGE || !end || *end || parsed > UINT_MAX)
     FATAL("Bad value for %s: %s", option_name, value);
 
   return (u32)parsed;
@@ -225,7 +227,7 @@ static int file_exists(const char *path) {
 static int is_absolute_path(const char *path) {
   if (!path || !path[0]) return 0;
   if ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z'))
-    return path[1] == ':';
+    return path[1] == ':' && (path[2] == '\\' || path[2] == '/');
   return (path[0] == '\\' && path[1] == '\\') || path[0] == '/';
 }
 
@@ -503,15 +505,37 @@ static void append_hash_index(const char *path, u32 hash) {
   fclose(fp);
 }
 
+static int first_line_equals(const char *path, const char *expected);
+
+static const char *queue_manifest_header(void) {
+  return "queue_id\tkind\tqueue_path\tsource_seed\tsignal_hash\tdetail";
+}
+
+static void rotate_old_schema_file(const char *path, const char *label) {
+  char *rotated_path = alloc_numbered_suffix_path(path, ".old-schema");
+
+  if (!MoveFileExA(path, rotated_path, MOVEFILE_REPLACE_EXISTING)) {
+    FATAL("Unable to rotate incompatible %s '%s' to '%s' (GetLastError=%lu)",
+          label, path, rotated_path, GetLastError());
+  }
+
+  WARNF("Rotated incompatible %s to '%s'", label, rotated_path);
+  ck_free(rotated_path);
+}
+
 static void ensure_queue_manifest_header(run_state_t *state) {
   FILE *fp;
 
-  if (file_exists(state->queue_manifest_path)) return;
+  if (file_exists(state->queue_manifest_path)) {
+    if (first_line_equals(state->queue_manifest_path,
+                          queue_manifest_header())) return;
+    rotate_old_schema_file(state->queue_manifest_path, "queue manifest");
+  }
 
   fp = fopen(state->queue_manifest_path, "w");
   if (!fp) return;
 
-  fprintf(fp, "queue_id\tkind\tqueue_path\tsource_seed\tsignal_hash\tdetail\n");
+  fprintf(fp, "%s\n", queue_manifest_header());
   fclose(fp);
 }
 
@@ -554,20 +578,7 @@ static void ensure_exec_log_header(run_state_t *state) {
 
   if (file_exists(state->exec_log_path)) {
     if (first_line_equals(state->exec_log_path, exec_log_header())) return;
-
-    {
-      char *rotated_path = alloc_numbered_suffix_path(state->exec_log_path,
-                                                      ".old-schema");
-
-      if (!MoveFileExA(state->exec_log_path, rotated_path,
-                       MOVEFILE_REPLACE_EXISTING)) {
-        FATAL("Unable to rotate incompatible execution log '%s' to '%s' (GetLastError=%lu)",
-              state->exec_log_path, rotated_path, GetLastError());
-      }
-
-      WARNF("Rotated incompatible execution log to '%s'", rotated_path);
-      ck_free(rotated_path);
-    }
+    rotate_old_schema_file(state->exec_log_path, "execution log");
   }
 
   fp = fopen(state->exec_log_path, "w");
@@ -894,11 +905,18 @@ static void snapshot_and_set_env(env_snapshot_t **snapshots_ref,
   memset(&snapshot, 0, sizeof(snapshot));
   snapshot.name = alloc_printf("%s", name);
 
+  SetLastError(ERROR_SUCCESS);
   needed = GetEnvironmentVariableA(name, NULL, 0);
   if (needed) {
     snapshot.old_value = (char *)ck_alloc(needed);
-    if (GetEnvironmentVariableA(name, snapshot.old_value, needed))
+    snapshot.old_value[0] = '\0';
+    SetLastError(ERROR_SUCCESS);
+    if (GetEnvironmentVariableA(name, snapshot.old_value, needed) ||
+        GetLastError() != ERROR_ENVVAR_NOT_FOUND)
       snapshot.had_old_value = 1;
+  } else if (GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
+    snapshot.old_value = alloc_printf("%s", "");
+    snapshot.had_old_value = 1;
   }
 
   if (!SetEnvironmentVariableA(name, value))
@@ -992,7 +1010,14 @@ static void write_replay_helper(const char *script_path, const char *artifact_pa
     int i;
 
     fprintf(fp, "param([string]$AFLNetReplay = \".\\aflnet-replay.exe\")\n");
+    fprintf(fp, "function Test-AFLNetAbsolutePath([string]$Path) {\n");
+    fprintf(fp, "  if ([string]::IsNullOrEmpty($Path)) { return $false }\n");
+    fprintf(fp, "  $isDrive = $Path.Length -ge 3 -and $Path[1] -eq ':' -and (($Path[0] -ge 'A' -and $Path[0] -le 'Z') -or ($Path[0] -ge 'a' -and $Path[0] -le 'z'))\n");
+    fprintf(fp, "  if ($isDrive) { return $Path[2] -eq '\\' -or $Path[2] -eq '/' }\n");
+    fprintf(fp, "  return $Path.StartsWith('\\\\') -or $Path.StartsWith('/')\n");
+    fprintf(fp, "}\n");
     fprintf(fp, "$target = $null\n");
+    fprintf(fp, "$replayExitCode = 0\n");
     fprintf(fp, "$targetExe = ");
     fprintf_ps_quoted(fp, opts->target_argv[0]);
     fprintf(fp, "\n$targetCwd = ");
@@ -1016,33 +1041,39 @@ static void write_replay_helper(const char *script_path, const char *artifact_pa
       fprintf(fp, "\n");
       ck_free(name);
     }
-    fprintf(fp, "$oldEnv = @{}\n");
-    fprintf(fp, "foreach ($name in $targetEnv.Keys) {\n");
-    fprintf(fp, "  $oldEnv[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')\n");
-    fprintf(fp, "  [Environment]::SetEnvironmentVariable($name, $targetEnv[$name], 'Process')\n");
-    fprintf(fp, "}\n");
-    fprintf(fp, "if ($targetCwd -and -not [System.IO.Path]::IsPathRooted($targetExe)) {\n");
+    fprintf(fp, "if ($targetCwd -and -not (Test-AFLNetAbsolutePath $targetExe)) {\n");
     fprintf(fp, "  $candidate = Join-Path $targetCwd $targetExe\n");
     fprintf(fp, "  if (Test-Path -LiteralPath $candidate) { $targetExe = $candidate }\n");
     fprintf(fp, "}\n");
     fprintf(fp, "try {\n");
-    fprintf(fp, "  $startArgs = @{ FilePath = $targetExe; ArgumentList = $targetArgs; PassThru = $true }\n");
-    fprintf(fp, "  if ($targetCwd) { $startArgs.WorkingDirectory = $targetCwd }\n");
-    fprintf(fp, "  $target = Start-Process @startArgs\n");
-    fprintf(fp, "} finally {\n");
-    fprintf(fp, "  foreach ($name in $targetEnv.Keys) {\n");
-    fprintf(fp, "    [Environment]::SetEnvironmentVariable($name, $oldEnv[$name], 'Process')\n");
-    fprintf(fp, "  }\n");
-    fprintf(fp, "}\n");
-    fprintf(fp, "Start-Sleep -Milliseconds %u\n", (opts->server_wait_usecs + 999) / 1000);
-    fprintf(fp, "& $AFLNetReplay ");
+    fprintf(fp, "  $targetStartInfo = [System.Diagnostics.ProcessStartInfo]::new()\n");
+    fprintf(fp, "  $targetStartInfo.FileName = $targetExe\n");
+    fprintf(fp, "  $targetStartInfo.UseShellExecute = $false\n");
+    fprintf(fp, "  if ($targetCwd) { $targetStartInfo.WorkingDirectory = $targetCwd }\n");
+    fprintf(fp, "  foreach ($arg in $targetArgs) { [void]$targetStartInfo.ArgumentList.Add($arg) }\n");
+    fprintf(fp, "  foreach ($name in $targetEnv.Keys) { $targetStartInfo.EnvironmentVariables[$name] = $targetEnv[$name] }\n");
+    fprintf(fp, "  $target = [System.Diagnostics.Process]::Start($targetStartInfo)\n");
+    fprintf(fp, "  Start-Sleep -Milliseconds %u\n", (opts->server_wait_usecs + 999) / 1000);
+    fprintf(fp, "  $replayArgs = @(");
     fprintf_ps_quoted(fp, artifact_path);
-    fprintf(fp, " ");
+    fprintf(fp, ", ");
     fprintf_ps_quoted(fp, opts->protocol);
-    fprintf(fp, " ");
+    fprintf(fp, ", ");
     fprintf_ps_quoted(fp, opts->net_config);
-    fprintf(fp, "\n");
-    fprintf(fp, "if ($target) { Stop-Process -Id $target.Id -Force -ErrorAction SilentlyContinue }\n");
+    fprintf(fp, ", ");
+    fprintf(fp, "'%u', '%u')\n", opts->poll_wait_msecs,
+            opts->socket_timeout_usecs);
+    fprintf(fp, "  $replayStartInfo = [System.Diagnostics.ProcessStartInfo]::new()\n");
+    fprintf(fp, "  $replayStartInfo.FileName = $AFLNetReplay\n");
+    fprintf(fp, "  $replayStartInfo.UseShellExecute = $false\n");
+    fprintf(fp, "  foreach ($arg in $replayArgs) { [void]$replayStartInfo.ArgumentList.Add($arg) }\n");
+    fprintf(fp, "  $replay = [System.Diagnostics.Process]::Start($replayStartInfo)\n");
+    fprintf(fp, "  $replay.WaitForExit()\n");
+    fprintf(fp, "  $replayExitCode = $replay.ExitCode\n");
+    fprintf(fp, "} finally {\n");
+    fprintf(fp, "  if ($target) { Stop-Process -Id $target.Id -Force -ErrorAction SilentlyContinue }\n");
+    fprintf(fp, "}\n");
+    fprintf(fp, "exit $replayExitCode\n");
     fclose(fp);
   }
 }
@@ -1071,14 +1102,17 @@ static void write_replay_metadata(const char *artifact_path, options_t *opts,
   fprintf(fp, "minidump          : %s\n", minidump_path ? minidump_path : "none");
   fprintf(fp, "protocol          : %s\n", opts->protocol);
   fprintf(fp, "net_config        : %s\n", opts->net_config);
+  fprintf(fp, "poll_wait_msecs   : %u\n", opts->poll_wait_msecs);
+  fprintf(fp, "socket_timeout_us : %u\n", opts->socket_timeout_usecs);
   fprintf(fp, "target_cwd        : %s\n", opts->target_cwd ? opts->target_cwd : ".");
   fprintf(fp, "target_command    : %s\n", target_cmd);
   fprintf(fp, "target_env_vars   : %u\n", opts->target_env_count);
   for (int i = 0; i < (int)opts->target_env_count; i++)
     fprintf(fp, "target_env_%03d    : %s\n", i, opts->target_env[i]);
   fprintf(fp, "manual_replay     : start the target command, then run:\n");
-  fprintf(fp, "manual_replay_cmd : aflnet-replay.exe \"%s\" %s %s\n",
-          artifact_path, opts->protocol, opts->net_config);
+  fprintf(fp, "manual_replay_cmd : aflnet-replay.exe \"%s\" %s %s %u %u\n",
+          artifact_path, opts->protocol, opts->net_config,
+          opts->poll_wait_msecs, opts->socket_timeout_usecs);
 
   fclose(fp);
 
@@ -1108,14 +1142,17 @@ static void write_hang_metadata(const char *artifact_path, options_t *opts,
   fprintf(fp, "timeout_ms        : %u\n", opts->target_shutdown_ms);
   fprintf(fp, "protocol          : %s\n", opts->protocol);
   fprintf(fp, "net_config        : %s\n", opts->net_config);
+  fprintf(fp, "poll_wait_msecs   : %u\n", opts->poll_wait_msecs);
+  fprintf(fp, "socket_timeout_us : %u\n", opts->socket_timeout_usecs);
   fprintf(fp, "target_cwd        : %s\n", opts->target_cwd ? opts->target_cwd : ".");
   fprintf(fp, "target_command    : %s\n", target_cmd);
   fprintf(fp, "target_env_vars   : %u\n", opts->target_env_count);
   for (int i = 0; i < (int)opts->target_env_count; i++)
     fprintf(fp, "target_env_%03d    : %s\n", i, opts->target_env[i]);
   fprintf(fp, "manual_replay     : start the target command, then run:\n");
-  fprintf(fp, "manual_replay_cmd : aflnet-replay.exe \"%s\" %s %s\n",
-          artifact_path, opts->protocol, opts->net_config);
+  fprintf(fp, "manual_replay_cmd : aflnet-replay.exe \"%s\" %s %s %u %u\n",
+          artifact_path, opts->protocol, opts->net_config,
+          opts->poll_wait_msecs, opts->socket_timeout_usecs);
   fclose(fp);
 
   write_replay_helper(script_path, artifact_path, opts);
@@ -1374,6 +1411,32 @@ static DWORD wait_target_process(target_process_t *target, DWORD timeout_ms,
   }
 }
 
+static int request_region_bounds(region_t *regions, u32 region_count,
+                                 u32 index, u32 len,
+                                 u32 *start_ref, u32 *size_ref) {
+  region_t *region;
+  int start;
+  int end;
+  u32 start_u;
+  u32 end_u;
+
+  if (!regions || !len || index >= region_count) return 0;
+
+  region = &regions[index];
+  start = region->start_byte;
+  end = region->end_byte;
+
+  if (start < 0 || end < start) return 0;
+
+  start_u = (u32)start;
+  end_u = (u32)end;
+  if (start_u >= len || end_u >= len) return 0;
+
+  *start_ref = start_u;
+  *size_ref = end_u - start_u + 1;
+  return *size_ref != 0;
+}
+
 static void mutate(options_t *opts, u8 *buf, u32 len, region_t *regions,
                    u32 region_count, u32 mutations) {
   u32 i;
@@ -1381,28 +1444,25 @@ static void mutate(options_t *opts, u8 *buf, u32 len, region_t *regions,
   if (!len) return;
 
   for (i = 0; i < mutations; i++) {
-    region_t *region = &regions[rand() % region_count];
-    int start = region->start_byte;
-    int end = region->end_byte;
     u32 pos;
+    u32 start = 0;
+    u32 region_len = len;
     u8 op = rand() % (opts->dict_token_count ? 5 : 4);
 
-    if (start < 0 || end < start || (u32)end >= len) {
-      start = 0;
-      end = (int)len - 1;
-    }
+    if (region_count)
+      request_region_bounds(regions, region_count, rand() % region_count,
+                            len, &start, &region_len);
 
     if (op == 4) {
       dict_token_t *token = &opts->dict_tokens[rand() % opts->dict_token_count];
-      u32 region_len = (u32)(end - start + 1);
       u32 copy_len = MIN(token->len, region_len);
 
       if (!copy_len) continue;
 
-      pos = (u32)start + (rand() % (region_len - copy_len + 1));
+      pos = start + (rand() % (region_len - copy_len + 1));
       memcpy(buf + pos, token->data, copy_len);
     } else {
-      pos = (u32)start + (rand() % ((u32)(end - start + 1)));
+      pos = start + (rand() % region_len);
 
       switch (op) {
         case 0:
@@ -1422,20 +1482,22 @@ static void mutate(options_t *opts, u8 *buf, u32 len, region_t *regions,
   }
 }
 
-static void save_replay_file(const char *path, u8 *buf, region_t *regions, u32 region_count) {
+static void save_replay_file(const char *path, u8 *buf, u32 len,
+                             region_t *regions, u32 region_count) {
   FILE *fp = fopen(path, "wb");
   u32 i;
 
   if (!fp) PFATAL("Unable to create replay file '%s'", path);
 
   for (i = 0; i < region_count; i++) {
+    u32 start;
     u32 size;
 
-    if (regions[i].start_byte < 0 || regions[i].end_byte < regions[i].start_byte) continue;
-    size = (u32)(regions[i].end_byte - regions[i].start_byte + 1);
+    if (!request_region_bounds(regions, region_count, i, len, &start, &size))
+      continue;
 
     if (fwrite(&size, sizeof(size), 1, fp) != 1 ||
-        fwrite(buf + regions[i].start_byte, 1, size, fp) != size) {
+        fwrite(buf + start, 1, size, fp) != size) {
       PFATAL("Short write to replay file '%s'", path);
     }
   }
@@ -1443,7 +1505,8 @@ static void save_replay_file(const char *path, u8 *buf, region_t *regions, u32 r
   fclose(fp);
 }
 
-static int send_sequence(options_t *opts, u8 *buf, region_t *regions, u32 region_count,
+static int send_sequence(options_t *opts, u8 *buf, u32 len,
+                         region_t *regions, u32 region_count,
                          char **response_buf_ref, unsigned int *response_len_ref) {
   aflnet_socket_t sockfd = AFLNET_INVALID_SOCKET;
   struct timeval timeout;
@@ -1463,12 +1526,13 @@ static int send_sequence(options_t *opts, u8 *buf, region_t *regions, u32 region
   }
 
   for (i = 0; i < region_count; i++) {
+    u32 start;
     u32 size;
 
-    if (regions[i].start_byte < 0 || regions[i].end_byte < regions[i].start_byte) continue;
-    size = (u32)(regions[i].end_byte - regions[i].start_byte + 1);
+    if (!request_region_bounds(regions, region_count, i, len, &start, &size))
+      continue;
 
-    n = net_send(sockfd, timeout, (char *)(buf + regions[i].start_byte), size);
+    n = net_send(sockfd, timeout, (char *)(buf + start), size);
     if (n != (int)size) {
       aflnet_close_socket(sockfd);
       return 1;
@@ -1697,7 +1761,7 @@ static int save_interesting_state(run_state_t *state, seed_t *seed, u8 *buf,
   queue_path = alloc_printf("%s\\id_%06u,state_%s.raw", state->queue_dir,
                             state->queued_paths, state_name);
 
-  save_replay_file(path, buf, seed->regions, seed->region_count);
+  save_replay_file(path, buf, seed->len, seed->regions, seed->region_count);
   save_raw_file(queue_path, buf, seed->len);
   write_discovery_metadata(path, "state", seed, queue_path, hash,
                            state_detail, state_count);
@@ -1739,7 +1803,7 @@ static u32 save_interesting_coverage(run_state_t *state, seed_t *seed, u8 *buf,
   queue_path = alloc_printf("%s\\id_%06u,cov_%08x.raw", state->queue_dir,
                             state->queued_paths, hash);
 
-  save_replay_file(path, buf, seed->regions, seed->region_count);
+  save_replay_file(path, buf, seed->len, seed->regions, seed->region_count);
   save_raw_file(queue_path, buf, seed->len);
   write_discovery_metadata(path, "coverage", seed, queue_path, hash, detail,
                            coverage_len);
@@ -1865,7 +1929,8 @@ static void fuzz_one(options_t *opts, run_state_t *state, seed_t **seeds_ref,
     exit_code = 0;
   }
 
-  send_failed = send_sequence(opts, mutated, seed_regions, seed_region_count,
+  send_failed = send_sequence(opts, mutated, seed_len,
+                              seed_regions, seed_region_count,
                               &response_buf, &response_len);
 
   if (!opts->no_launch) {
@@ -1912,7 +1977,7 @@ static void fuzz_one(options_t *opts, run_state_t *state, seed_t **seeds_ref,
                                 state->crashes_dir, state->saved_crashes,
                                 (unsigned long)exit_code, crash_hash);
       char *dump_path = NULL;
-      save_replay_file(path, mutated, seed_regions, seed_region_count);
+      save_replay_file(path, mutated, seed_len, seed_regions, seed_region_count);
       if (debug_dump_written && debug_dump_path && file_exists(debug_dump_path)) {
         dump_path = append_suffix(path, ".dmp");
         if (!MoveFileExA(debug_dump_path, dump_path, MOVEFILE_REPLACE_EXISTING)) {
@@ -1937,7 +2002,7 @@ static void fuzz_one(options_t *opts, run_state_t *state, seed_t **seeds_ref,
       char *path = alloc_printf("%s\\id_%06u,hang_%08x",
                                 state->hangs_dir, state->saved_hangs,
                                 hang_hash);
-      save_replay_file(path, mutated, seed_regions, seed_region_count);
+      save_replay_file(path, mutated, seed_len, seed_regions, seed_region_count);
       write_hang_metadata(path, opts, hang_hash);
       append_hash_index(state->hang_index_path, hang_hash);
       state->saved_hangs++;
@@ -1947,7 +2012,7 @@ static void fuzz_one(options_t *opts, run_state_t *state, seed_t **seeds_ref,
     char *path = alloc_printf("%s\\id_%06u,send_failed", state->net_errors_dir,
                               state->saved_net_errors);
     outcome = "net_error";
-    save_replay_file(path, mutated, seed_regions, seed_region_count);
+    save_replay_file(path, mutated, seed_len, seed_regions, seed_region_count);
     state->saved_net_errors++;
     ck_free(path);
   } else if (send_failed) {
