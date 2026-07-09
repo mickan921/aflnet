@@ -3,8 +3,7 @@
 
 #include "klist.h"
 #include "khash.h"
-#include <arpa/inet.h>
-#include <poll.h>
+#include "afl-compat.h"
 
 typedef struct {
   int start_byte;                 /* The start byte, negative if unknown. */
@@ -57,6 +56,9 @@ enum {
   /* 02 */ IPSM_SCHEDULE,    // choose next seeds based on state machine
   /* 03 */ HYBRID_SCHEDULE,  // choose next seeds based on state machine only when the fuzzer is stuck
 };
+
+typedef unsigned int* (*aflnet_extract_response_codes_fn)(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+typedef region_t* (*aflnet_extract_requests_fn)(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
 
 // Initialize klist linked list data structure
 #define message_t_freer(x)
@@ -113,11 +115,15 @@ region_t* extract_requests_NTP(unsigned char* buf, unsigned int buf_size, unsign
 region_t* extract_requests_SNMP(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
 extern region_t* (*extract_requests)(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
 
+int aflnet_select_protocol(const char* protocol,
+                           aflnet_extract_requests_fn *requests_fn,
+                           aflnet_extract_response_codes_fn *responses_fn);
+
 // Network communication functions
 
 // Two wrappers for sending and receiving data over socket
-int net_send(int sockfd, struct timeval timeout, char *mem, unsigned int len);
-int net_recv(int sockfd, struct timeval timeout, int poll_w, char **response_buf, unsigned int *len);
+int net_send(aflnet_socket_t sockfd, struct timeval timeout, char *mem, unsigned int len);
+int net_recv(aflnet_socket_t sockfd, struct timeval timeout, int poll_w, char **response_buf, unsigned int *len);
 
 // kl_messages manipulating functions
 
@@ -149,6 +155,18 @@ void str_rtrim(char* a_str);
 
 /* Parse user provided server information to get IP address, transport protocol (TCP/UDP) and port number */
 int parse_net_config(u8* net_config, u8* protocol, u8** ip_address, u32* port);
+
+/* True for AFLNet protocols that historically default to UDP replay. */
+int aflnet_protocol_uses_udp(const char *protocol);
+
+/* Create and connect a socket using tcp/udp protocol, host, and port. */
+int aflnet_connect(aflnet_socket_t *sockfd_ref, u8 net_protocol,
+                   const char *host, u32 port, struct timeval timeout);
+
+/* Parse a replay target argument: either a full tcp://host/port config or
+   a legacy port number that defaults host to 127.0.0.1. */
+int aflnet_parse_replay_target(const char *target_arg, const char *protocol,
+                               u8 *net_protocol, u8 **host, u32 *port);
 
 /* Convert state sequence to string */
 u8* state_sequence_to_string(unsigned int *stateSequence, unsigned int stateCount);

@@ -14,6 +14,15 @@ aflnet-replay
 aflnet.o
 as
 
+# CMake / Windows port outputs.
+build-win/
+out-smoke/
+out-win/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.exe
+
 # Binaries produced by "make -C llvm_mode"
 afl-clang-fast
 afl-clang-fast++

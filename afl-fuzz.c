@@ -360,7 +360,7 @@ u8 net_protocol;
 u8* net_ip;
 u32 net_port;
 char *response_buf = NULL;
-int response_buf_size = 0; //the size of the whole response buffer
+u32 response_buf_size = 0; //the size of the whole response buffer
 u32 *response_bytes = NULL; //an array keeping accumulated response buffer size
                             //e.g., response_bytes[i] keeps the response buffer size
                             //once messages 0->i have been received and processed by the SUT
@@ -992,7 +992,7 @@ int send_over_network()
   if (cleanup_script) system(cleanup_script);
 
   //Wait a bit for the server initialization
-  usleep(server_wait_usecs);
+  aflnet_sleep_us(server_wait_usecs);
 
   //Clear the response buffer and reset the response buffer size
   if (response_buf) {
@@ -1007,13 +1007,15 @@ int send_over_network()
   }
 
   //Create a TCP/UDP socket
-  int sockfd = -1;
+  if (aflnet_init_sockets()) FATAL("Unable to initialize Windows sockets");
+
+  aflnet_socket_t sockfd = AFLNET_INVALID_SOCKET;
   if (net_protocol == PRO_TCP)
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
   else if (net_protocol == PRO_UDP)
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
-  if (sockfd < 0) {
+  if (sockfd == AFLNET_INVALID_SOCKET) {
     PFATAL("Cannot create a socket");
   }
 
@@ -1022,7 +1024,7 @@ int send_over_network()
   struct timeval timeout;
   timeout.tv_sec = 0;
   timeout.tv_usec = socket_timeout_usecs;
-  setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
+  aflnet_set_socket_timeout(sockfd, SO_SNDTIMEO, timeout);
 
   memset(&serv_addr, '0', sizeof(serv_addr));
 
@@ -1044,15 +1046,15 @@ int send_over_network()
     }
   }
 
-  if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+  if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == AFLNET_SOCKET_ERROR) {
     //If it cannot connect to the server under test
     //try it again as the server initial startup time is varied
     for (n=0; n < 1000; n++) {
       if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) break;
-      usleep(1000);
+      aflnet_sleep_us(1000);
     }
     if (n== 1000) {
-      close(sockfd);
+      aflnet_close_socket(sockfd);
       return 1;
     }
   }
@@ -1105,7 +1107,7 @@ HANDLE_RESPONSES:
     if (has_new_bits(session_virgin_bits) != 2) break;
   }
 
-  close(sockfd);
+  aflnet_close_socket(sockfd);
 
   if (likely_buggy && false_negative_reduction) return 0;
 
@@ -9043,58 +9045,7 @@ int main(int argc, char** argv) {
       case 'P': /* protocol to be tested */
         if (protocol_selected) FATAL("Multiple -P options not supported");
 
-        if (!strcmp(optarg, "RTSP")) {
-          extract_requests = &extract_requests_rtsp;
-          extract_response_codes = &extract_response_codes_rtsp;
-        } else if (!strcmp(optarg, "FTP")) {
-          extract_requests = &extract_requests_ftp;
-          extract_response_codes = &extract_response_codes_ftp;
-        } else if (!strcmp(optarg, "MQTT")) {
-          extract_requests = &extract_requests_mqtt;
-          extract_response_codes = &extract_response_codes_mqtt;
-        } else if (!strcmp(optarg, "DTLS12")) {
-          extract_requests = &extract_requests_dtls12;
-          extract_response_codes = &extract_response_codes_dtls12;
-        } else if (!strcmp(optarg, "DNS")) {
-          extract_requests = &extract_requests_dns;
-          extract_response_codes = &extract_response_codes_dns;
-        } else if (!strcmp(optarg, "DICOM")) {
-          extract_requests = &extract_requests_dicom;
-          extract_response_codes = &extract_response_codes_dicom;
-        } else if (!strcmp(optarg, "SMTP")) {
-          extract_requests = &extract_requests_smtp;
-          extract_response_codes = &extract_response_codes_smtp;
-        } else if (!strcmp(optarg, "SSH")) {
-          extract_requests = &extract_requests_ssh;
-          extract_response_codes = &extract_response_codes_ssh;
-        } else if (!strcmp(optarg, "TLS")) {
-          extract_requests = &extract_requests_tls;
-          extract_response_codes = &extract_response_codes_tls;
-        } else if (!strcmp(optarg, "SIP")) {
-          extract_requests = &extract_requests_sip;
-          extract_response_codes = &extract_response_codes_sip;
-        } else if (!strcmp(optarg, "HTTP")) {
-          extract_requests = &extract_requests_http;
-          extract_response_codes = &extract_response_codes_http;
-        } else if (!strcmp(optarg, "IPP")) {
-          extract_requests = &extract_requests_ipp;
-          extract_response_codes = &extract_response_codes_ipp;
-        } else if (!strcmp(optarg, "TFTP")) {
-          extract_requests = &extract_requests_tftp;
-          extract_response_codes = &extract_response_codes_tftp;
-        }else if (!strcmp(optarg, "DHCP")) {
-          extract_requests = &extract_requests_dhcp;
-          extract_response_codes = &extract_response_codes_dhcp;
-        }else if (!strcmp(optarg, "SNTP")) {
-          extract_requests = &extract_requests_SNTP;
-          extract_response_codes = &extract_response_codes_SNTP;
-        }else if (!strcmp(optarg, "NTP")) {
-          extract_requests = &extract_requests_NTP;
-          extract_response_codes = &extract_response_codes_NTP;
-        }else if (!strcmp(optarg, "SNMP")) {
-          extract_requests = &extract_requests_SNMP;
-          extract_response_codes = &extract_response_codes_SNMP;
-        } else {
+        if (aflnet_select_protocol(optarg, &extract_requests, &extract_response_codes)) {
           FATAL("%s protocol is not supported yet!", optarg);
         }
 
